@@ -3,22 +3,32 @@ Pokemon Agent — FastAPI Game Server
 
 Provides HTTP + WebSocket API for controlling a Game Boy / GBA emulator
 running a Pokemon ROM, reading game state, and broadcasting events.
+
+The emulator runs in a dedicated background thread (``EmulatorRuntime``)
+that ticks at 60 Hz independently of HTTP traffic, so dashboard viewers see
+NPC animation, dialog text typing, and battle effects play in real time.
 """
 
 import asyncio
 import base64
-import io
 import json
 import re
 import time
-from functools import partial
 from pathlib import Path
-from typing import Optional, Set
+from typing import List, Optional, Set
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
+
+from pokemon_agent.runtime import (
+    AUntilDialogEndProgram,
+    EmulatorRuntime,
+    InputEdge,
+    Program,
+    ScheduledProgram,
+)
 
 __version__ = "0.1.0"
 
@@ -36,8 +46,15 @@ class GameConfig(BaseModel):
 
 
 class ActionRequest(BaseModel):
-    """Body for POST /action."""
-    actions: list[str]
+    """Body for POST /action.
+
+    The ``realtime`` and ``fps`` fields are accepted for backwards
+    compatibility but are now no-ops: the world free-runs at 60 Hz at all
+    times, so action pacing happens automatically.
+    """
+    actions: List[str]
+    realtime: bool = False  # deprecated, no-op
+    fps: int = 60           # deprecated, no-op
 
 
 class SaveRequest(BaseModel):
@@ -50,8 +67,7 @@ class SaveRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 _config: Optional[GameConfig] = None
-_emulator = None          # Emulator instance
-_reader = None            # GameMemoryReader subclass instance
+_runtime: Optional[EmulatorRuntime] = None
 _start_time: float = 0.0
 _loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -92,21 +108,16 @@ def _detect_game_type(rom_path: str) -> str:
     raise ValueError(f"Unrecognised ROM extension: {ext}")
 
 
-def _ensure_emulator():
-    """Raise 503 if the emulator isn't ready."""
-    if _emulator is None:
+def _ensure_runtime() -> EmulatorRuntime:
+    """Raise 503 if the runtime isn't ready; return it otherwise."""
+    if _runtime is None:
         raise HTTPException(status_code=503, detail="Emulator not initialised")
-
-
-async def _run_sync(func, *args):
-    """Run a blocking emulator call in the default executor."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, partial(func, *args))
+    return _runtime
 
 
 async def broadcast(event: dict):
     """Send a JSON event to every connected WebSocket client."""
-    dead: list[WebSocket] = []
+    dead: List[WebSocket] = []
     payload = json.dumps(event)
     for ws in _ws_clients:
         try:
@@ -117,99 +128,70 @@ async def broadcast(event: dict):
         _ws_clients.discard(ws)
 
 
-def _get_state_dict() -> dict:
-    """Build full game state from the memory reader."""
-    from pokemon_agent.state.builder import build_game_state
-    return build_game_state(_reader)
-
-
-def _get_screenshot_bytes() -> bytes:
-    """Grab the current frame as PNG bytes."""
-    screen = _emulator.get_screen()          # PIL Image or numpy array
-    buf = io.BytesIO()
-    # If it's a numpy array, convert to PIL first
-    try:
-        from PIL import Image
-        if not isinstance(screen, Image.Image):
-            import numpy as np
-            screen = Image.fromarray(screen)
-        screen.save(buf, format="PNG")
-    except ImportError:
-        # Fallback: assume screen already has save()
-        screen.save(buf, format="PNG")
-    return buf.getvalue()
-
-
 # ---------------------------------------------------------------------------
 # Action parser
 # ---------------------------------------------------------------------------
 
-_ACTION_RE = re.compile(
-    r"^(?P<kind>press|walk|hold|wait|a_until_dialog_end)(?:_(?P<rest>.+))?$"
-)
+# Movement / press timing constants — keep in sync with the legacy semantics
+# documented at the previous server.py:217–228.  The agent skill expects:
+#   press_X / walk_X : button held for 8 frames, total program duration 20 frames
+#   hold_X_N         : button held for N frames, program duration N frames
+#   wait_N           : no input, duration N frames
+_HOLD_FRAMES = 8
+_TOTAL_FRAMES = 20
 
 
-async def _execute_action(action_str: str) -> None:
-    """Parse and execute a single action string on the emulator.
+def _build_program_for_action(action_str: str) -> Program:
+    """Parse a single action string into a runtime ``Program``.
 
     Supported formats:
-        press_X       — press button X for 10 frames, wait 20 frames
-        walk_X        — press direction for 16 frames, wait 8 frames
-        hold_X_N      — hold button X for N frames
-        wait_N        — tick N frames with no input
-        a_until_dialog_end — press A every 30 frames until dialog clears (max 300)
+        press_X            — press button X (held 8 frames, total 20)
+        walk_X             — same shape as press, semantically a tile move
+        hold_X_N           — hold button X for N frames
+        wait_N             — tick N frames with no input
+        a_until_dialog_end — press A every 30 frames until dialog clears
     """
     action_str = action_str.strip().lower()
 
     if action_str == "a_until_dialog_end":
-        for _ in range(10):  # max 300 frames = 10 * 30
-            await _run_sync(_emulator.press, "a")
-            await _run_sync(_emulator.tick, 30)
-            # Check dialog flag via reader if available
-            try:
-                state = _get_state_dict()
-                if not state.get("dialog_active", False):
-                    break
-            except Exception:
-                pass
-        return
+        return AUntilDialogEndProgram()
 
-    # Split into tokens
     parts = action_str.split("_")
 
-    if parts[0] == "press" and len(parts) >= 2:
+    if parts[0] in ("press", "walk") and len(parts) >= 2:
+        # walk_up = "_".join(["up"]) etc; press_a = "a"
         button = "_".join(parts[1:])
-        # Hold button for 8 frames so the game registers the press,
-        # then wait 12 frames for the game to process it.
-        await _run_sync(_emulator.press, button, 8)
-        await _run_sync(_emulator.tick, 12)
-        return
-
-    if parts[0] == "walk" and len(parts) >= 2:
-        direction = parts[1]
-        # Gen 1 movement timing (empirically tested):
-        #   - Button must be held >= 4 frames for the game's vblank joypad
-        #     poll to register the input reliably.
-        #   - wWalkCounter starts at 8, decrements each frame (2 px/frame
-        #     = 16 px = 1 tile). Total walk animation = ~16 frames.
-        #   - Minimum total frames for a confirmed tile move = 17.
-        #   - We use hold=8 + wait=12 = 20 total for a safety margin.
-        await _run_sync(_emulator.press, direction, 8)
-        await _run_sync(_emulator.tick, 12)
-        return
+        return ScheduledProgram(
+            edges=[
+                InputEdge(0, button, True),
+                InputEdge(_HOLD_FRAMES, button, False),
+            ],
+            duration=_TOTAL_FRAMES,
+        )
 
     if parts[0] == "hold" and len(parts) >= 3:
         button = "_".join(parts[1:-1])
         frames = int(parts[-1])
-        await _run_sync(_emulator.press, button, frames)
-        return
+        return ScheduledProgram(
+            edges=[
+                InputEdge(0, button, True),
+                InputEdge(frames, button, False),
+            ],
+            duration=frames,
+        )
 
     if parts[0] == "wait" and len(parts) == 2:
         frames = int(parts[1])
-        await _run_sync(_emulator.tick, frames)
-        return
+        return ScheduledProgram(edges=[], duration=frames)
 
     raise ValueError(f"Unknown action format: {action_str}")
+
+
+async def _run_program(program: Program) -> None:
+    """Submit a program to the runtime and wait for it to complete."""
+    runtime = _ensure_runtime()
+    fut = runtime.submit_program(program)
+    await asyncio.wrap_future(fut)
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +206,7 @@ def configure(config: GameConfig):
 
 @app.on_event("startup")
 async def _startup():
-    global _emulator, _reader, _start_time, _config, _loop
+    global _runtime, _start_time, _config, _loop
     _loop = asyncio.get_running_loop()
     _start_time = time.time()
 
@@ -249,21 +231,39 @@ async def _startup():
 
     # Create emulator
     from pokemon_agent.emulator import create_emulator
-    _emulator = create_emulator(str(rom))
+    emu = create_emulator(str(rom))
 
     # Create memory reader
     if game_type == "red":
         from pokemon_agent.memory.red import PokemonRedReader
-        _reader = PokemonRedReader(_emulator)
+        reader = PokemonRedReader(emu)
     elif game_type == "firered":
-        from pokemon_agent.memory.firered import PokemonFireRedReader
-        _reader = PokemonFireRedReader(_emulator)
+        from pokemon_agent.memory.firered import FireRedMemoryReader
+        reader = FireRedMemoryReader(emu)
     else:
         raise ValueError(f"Unknown game type: {game_type}")
 
     # Create data directories
     data_dir = Path(_config.data_dir).expanduser().resolve()
     (data_dir / "saves").mkdir(parents=True, exist_ok=True)
+
+    # Auto-load a save state if specified — done before runtime starts so the
+    # initial published frame reflects the loaded state.
+    if _config.load_state:
+        saves_dir = data_dir / "saves"
+        state_path = saves_dir / f"{_config.load_state}.state"
+        if state_path.exists():
+            try:
+                emu.load_state(str(state_path))
+                print(f"[server] Loaded save state: {_config.load_state}")
+            except Exception as e:
+                print(f"[server] WARNING: Failed to load state '{_config.load_state}': {e}")
+        else:
+            print(f"[server] WARNING: Save state not found: {state_path}")
+
+    # Spin up the free-running runtime
+    _runtime = EmulatorRuntime(emu, reader)
+    _runtime.start()
 
     # Try mounting dashboard
     try:
@@ -279,24 +279,12 @@ async def _startup():
         print("[server] Dashboard not installed — /dashboard unavailable")
         print("[server]   Install with: pip install pokemon-agent[dashboard]")
 
-    # Auto-load a save state if specified
-    if _config.load_state:
-        saves_dir = data_dir / "saves"
-        state_path = saves_dir / f"{_config.load_state}.state"
-        if state_path.exists():
-            try:
-                _emulator.load_state(str(state_path))
-                print(f"[server] Loaded save state: {_config.load_state}")
-            except Exception as e:
-                print(f"[server] WARNING: Failed to load state '{_config.load_state}': {e}")
-        else:
-            print(f"[server] WARNING: Save state not found: {state_path}")
-
     print(f"[server] Ready — listening on port {_config.port}")
     print(f"[server] Endpoints:")
     print(f"[server]   GET  /          — server info")
     print(f"[server]   GET  /state     — game state")
     print(f"[server]   GET  /screenshot — current frame (PNG)")
+    print(f"[server]   GET  /stream.mjpg — live MJPEG stream")
     print(f"[server]   POST /action    — execute actions")
     print(f"[server]   POST /save      — save state")
     print(f"[server]   POST /load      — load state")
@@ -304,6 +292,15 @@ async def _startup():
     print(f"[server]   GET  /minimap   — ASCII minimap")
     print(f"[server]   GET  /health    — health check")
     print(f"[server]   WS   /ws        — live events")
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    """Stop the runtime cleanly so no thread is leaked."""
+    global _runtime
+    if _runtime is not None:
+        _runtime.stop()
+        _runtime = None
 
 
 # ---------------------------------------------------------------------------
@@ -319,22 +316,22 @@ async def index():
         "game": _config.game_type if _config else None,
         "rom": _config.rom_path if _config else None,
         "uptime_seconds": round(time.time() - _start_time, 1) if _start_time else 0,
-        "emulator_ready": _emulator is not None,
+        "emulator_ready": _runtime is not None,
     }
 
 
 @app.get("/health")
 async def health():
     """Health check."""
-    return {"status": "ok", "emulator_ready": _emulator is not None}
+    return {"status": "ok", "emulator_ready": _runtime is not None}
 
 
 @app.get("/state")
 async def get_state():
-    """Full game state JSON."""
-    _ensure_emulator()
+    """Full game state JSON (atomic snapshot under the runtime lock)."""
+    runtime = _ensure_runtime()
     try:
-        state = await _run_sync(_get_state_dict)
+        state = await asyncio.to_thread(runtime.snapshot_state)
         return JSONResponse(content=state)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error reading state: {e}")
@@ -342,11 +339,15 @@ async def get_state():
 
 @app.get("/screenshot")
 async def screenshot():
-    """Current emulator frame as PNG image."""
-    _ensure_emulator()
+    """Current emulator frame as PNG image (from the published latest-frame slot)."""
+    runtime = _ensure_runtime()
     try:
-        png_bytes = await _run_sync(_get_screenshot_bytes)
+        seq, png_bytes = runtime.peek_frame()
+        if not png_bytes:
+            raise HTTPException(status_code=503, detail="No frame published yet")
         return Response(content=png_bytes, media_type="image/png")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Screenshot error: {e}")
 
@@ -354,33 +355,81 @@ async def screenshot():
 @app.get("/screenshot/base64")
 async def screenshot_base64():
     """Current emulator frame as base64-encoded PNG in JSON."""
-    _ensure_emulator()
+    runtime = _ensure_runtime()
     try:
-        png_bytes = await _run_sync(_get_screenshot_bytes)
+        seq, png_bytes = runtime.peek_frame()
+        if not png_bytes:
+            raise HTTPException(status_code=503, detail="No frame published yet")
         b64 = base64.b64encode(png_bytes).decode("ascii")
-        return {"image": b64, "format": "png"}
+        return {"image": b64, "format": "png", "seq": seq}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Screenshot error: {e}")
 
 
+@app.get("/stream.mjpg")
+async def mjpeg_stream(fps: int = 15, frames: Optional[int] = None):
+    """Live MJPEG stream of the published frame.
+
+    Reads from the runtime's latest-frame slot (no per-request emulator
+    access) so the encode cost is shared across all viewers.  ``frames`` is
+    primarily for tests; omit for an endless stream.
+    """
+    runtime = _ensure_runtime()
+    fps = max(1, min(int(fps), 30))
+    delay = 1.0 / fps
+    boundary = "frame"
+
+    async def frame_generator():
+        sent = 0
+        last_seq = -1
+        while frames is None or sent < frames:
+            seq, png_bytes = runtime.peek_frame()
+            if png_bytes and seq != last_seq:
+                last_seq = seq
+                yield (
+                    b"--" + boundary.encode("ascii") + b"\r\n"
+                    b"Content-Type: image/png\r\n"
+                    b"Cache-Control: no-cache, no-store, must-revalidate\r\n"
+                    b"Pragma: no-cache\r\n"
+                    b"Expires: 0\r\n"
+                    b"Content-Length: " + str(len(png_bytes)).encode("ascii") + b"\r\n\r\n"
+                    + png_bytes
+                    + b"\r\n"
+                )
+                sent += 1
+            if frames is None or sent < frames:
+                await asyncio.sleep(delay)
+        yield b"--" + boundary.encode("ascii") + b"--\r\n"
+
+    return StreamingResponse(
+        frame_generator(),
+        media_type=f"multipart/x-mixed-replace; boundary={boundary}",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
+
+
 @app.post("/action")
 async def execute_actions(req: ActionRequest):
-    """Execute a sequence of game actions."""
-    _ensure_emulator()
+    """Execute a sequence of game actions through the runtime.
+
+    Caller-visible semantics: blocks until all actions complete, returns the
+    post-action state. Internally, each action is converted to a frame-
+    scheduled program submitted to the runtime thread.
+
+    If ``/action`` is in flight when another request arrives, the second
+    program queues behind the first.
+    """
+    runtime = _ensure_runtime()
     try:
         executed = 0
         for action_str in req.actions:
-            await _execute_action(action_str)
+            program = _build_program_for_action(action_str)
+            await _run_program(program)
             executed += 1
 
-        state_after = await _run_sync(_get_state_dict)
-
-        # Grab a screenshot for the live dashboard
-        try:
-            png_bytes = await _run_sync(_get_screenshot_bytes)
-            screenshot_b64 = base64.b64encode(png_bytes).decode("ascii")
-        except Exception:
-            screenshot_b64 = None
+        state_after = await asyncio.to_thread(runtime.snapshot_state)
 
         # Broadcast to WebSocket clients
         await broadcast({
@@ -389,12 +438,6 @@ async def execute_actions(req: ActionRequest):
             "actions_executed": executed,
             "state_after": state_after,
         })
-        # Also push the latest frame so the dashboard updates immediately
-        if screenshot_b64:
-            await broadcast({
-                "type": "screenshot",
-                "data": {"image": screenshot_b64, "format": "png"},
-            })
 
         return {
             "success": True,
@@ -403,21 +446,23 @@ async def execute_actions(req: ActionRequest):
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Action error: {e}")
 
 
 @app.post("/save")
 async def save_state(req: SaveRequest):
-    """Save emulator state to disk."""
-    _ensure_emulator()
+    """Save emulator state to disk (barriered through the runtime)."""
+    runtime = _ensure_runtime()
     if not _config:
         raise HTTPException(status_code=503, detail="Server not configured")
     try:
         saves_dir = Path(_config.data_dir).expanduser().resolve() / "saves"
         saves_dir.mkdir(parents=True, exist_ok=True)
         save_path = saves_dir / f"{req.name}.state"
-        await _run_sync(_emulator.save_state, str(save_path))
+        await asyncio.wrap_future(runtime.save_state(str(save_path)))
         return {"success": True, "path": str(save_path)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Save error: {e}")
@@ -425,8 +470,8 @@ async def save_state(req: SaveRequest):
 
 @app.post("/load")
 async def load_state(req: SaveRequest):
-    """Load emulator state from disk."""
-    _ensure_emulator()
+    """Load emulator state from disk (barriered through the runtime)."""
+    runtime = _ensure_runtime()
     if not _config:
         raise HTTPException(status_code=503, detail="Server not configured")
     try:
@@ -434,8 +479,8 @@ async def load_state(req: SaveRequest):
         save_path = saves_dir / f"{req.name}.state"
         if not save_path.exists():
             raise HTTPException(status_code=404, detail=f"Save not found: {req.name}")
-        await _run_sync(_emulator.load_state, str(save_path))
-        state_after = await _run_sync(_get_state_dict)
+        await asyncio.wrap_future(runtime.load_state(str(save_path)))
+        state_after = await asyncio.to_thread(runtime.snapshot_state)
 
         await broadcast({"type": "state_update", "reason": "load", "state": state_after})
 
@@ -473,13 +518,13 @@ async def list_saves():
 @app.get("/minimap")
 async def minimap():
     """Simple ASCII minimap — current map name + player position."""
-    _ensure_emulator()
+    runtime = _ensure_runtime()
     try:
-        state = await _run_sync(_get_state_dict)
-        map_info = state.get("map", {})
-        player = state.get("player", {})
+        state = await asyncio.to_thread(runtime.snapshot_state)
+        map_info = state.get("map", {}) or {}
+        player = state.get("player", {}) or {}
         map_name = map_info.get("map_name", "Unknown")
-        pos = player.get("position", {})
+        pos = player.get("position", {}) or {}
         x = pos.get("x", "?")
         y = pos.get("y", "?")
 
@@ -511,7 +556,7 @@ async def websocket_endpoint(ws: WebSocket):
         await ws.send_json({
             "type": "connected",
             "version": __version__,
-            "emulator_ready": _emulator is not None,
+            "emulator_ready": _runtime is not None,
         })
         # Keep alive — wait for client messages (or disconnect)
         while True:

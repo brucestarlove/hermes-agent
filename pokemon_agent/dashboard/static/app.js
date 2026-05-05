@@ -16,6 +16,8 @@
         Steel: '#B8B8D0', Fairy: '#EE99AC'
     };
     const POLL_INTERVAL = 3000;
+    let USE_MJPEG_STREAM = true;
+    const STREAM_FPS = 30;
     const WS_RECONNECT_BASE = 1000;
     const WS_RECONNECT_MAX = 30000;
 
@@ -167,12 +169,29 @@
 
     // --- Game Screen ---
     function renderGameScreen(base64png) {
+        if (USE_MJPEG_STREAM) return;
         if (!base64png) return;
         if (!hasReceivedFrame) {
             hasReceivedFrame = true;
             screenOverlay.classList.add('hidden');
         }
         gameScreen.src = 'data:image/png;base64,' + base64png;
+    }
+
+    function startLiveStream() {
+        if (!USE_MJPEG_STREAM) return false;
+        hasReceivedFrame = true;
+        screenOverlay.classList.add('hidden');
+        gameScreen.src = getBaseURL() + '/stream.mjpg?fps=' + STREAM_FPS + '&cache=' + Date.now();
+        gameScreen.onerror = function () {
+            hasReceivedFrame = false;
+            screenOverlay.classList.remove('hidden');
+            screenOverlay.querySelector('.overlay-text').textContent = 'Live stream unavailable; falling back to snapshots...';
+            USE_MJPEG_STREAM = false;
+            pollScreenshot();
+            screenshotTimer = setInterval(pollScreenshot, POLL_INTERVAL);
+        };
+        return true;
     }
 
     // --- Stats ---
@@ -468,8 +487,6 @@
                 lastStateJSON = stateJSON;
                 renderStats(statePayload);
             }
-        } else if (type === 'screenshot' && msg.data && msg.data.image) {
-            renderGameScreen(msg.data.image);
         } else {
             renderLog(msg);
         }
@@ -516,11 +533,14 @@
     }
 
     function startPolling() {
-        // Always poll for state and screenshots
+        // Always poll lightweight state; use MJPEG for the game screen when available.
         pollState();
-        pollScreenshot();
         pollTimer = setInterval(pollState, POLL_INTERVAL);
-        screenshotTimer = setInterval(pollScreenshot, POLL_INTERVAL);
+
+        if (!USE_MJPEG_STREAM) {
+            pollScreenshot();
+            screenshotTimer = setInterval(pollScreenshot, POLL_INTERVAL);
+        }
     }
 
     // --- Auto-scroll ---
@@ -574,6 +594,7 @@
 
         checkHealth();
         connectWS();
+        startLiveStream();
         startPolling();
     }
 

@@ -59,6 +59,18 @@ class Emulator(ABC):
         """
 
     @abstractmethod
+    def press_button(self, button: str) -> None:
+        """Press *button* without ticking. Caller advances frames separately.
+
+        Used by the free-running runtime which owns the tick loop and only
+        needs edge transitions from input commands.
+        """
+
+    @abstractmethod
+    def release_button(self, button: str) -> None:
+        """Release *button* without ticking. Pair with :meth:`press_button`."""
+
+    @abstractmethod
     def release_all(self) -> None:
         """Release every button."""
 
@@ -171,6 +183,20 @@ class PyBoyEmulator(Emulator):
         self.tick(frames)
         pb.button_release(button)  # type: ignore[union-attr]
 
+    def press_button(self, button: str) -> None:
+        """Press a button without ticking (edge-only)."""
+        button = button.lower()
+        if button not in self.BUTTONS:
+            raise ValueError(f"Unknown button '{button}'. Valid: {self.BUTTONS}")
+        self._pyboy.button_press(button)  # type: ignore[union-attr]
+
+    def release_button(self, button: str) -> None:
+        """Release a button without ticking (edge-only)."""
+        button = button.lower()
+        if button not in self.BUTTONS:
+            raise ValueError(f"Unknown button '{button}'. Valid: {self.BUTTONS}")
+        self._pyboy.button_release(button)  # type: ignore[union-attr]
+
     def release_all(self) -> None:
         """Release all buttons."""
         pb = self._pyboy
@@ -259,6 +285,7 @@ class PyGBAEmulator(Emulator):
     def __init__(self) -> None:
         super().__init__()
         self._gba: Optional[object] = None
+        self._framebuffer: Optional[object] = None
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -277,6 +304,12 @@ class PyGBAEmulator(Emulator):
             raise FileNotFoundError(f"ROM not found: {rom_path}")
 
         self._gba = PyGBA.load(rom_path)  # type: ignore[attr-defined]
+        # PyGBA does not expose a `.screen` attribute. mGBA renders into a
+        # caller-provided video buffer; set one up so /screenshot works.
+        import mgba.image  # type: ignore[import-untyped]
+        self._framebuffer = mgba.image.Image(*self._gba.core.desired_video_dimensions())
+        self._gba.core.set_video_buffer(self._framebuffer)
+        self._gba.core.reset()
         self.rom_path = rom_path
         self.frame_count = 0
 
@@ -291,8 +324,18 @@ class PyGBAEmulator(Emulator):
         method = self._BUTTON_MAP.get(button)
         if method is None:
             raise ValueError(f"Unknown button '{button}'. Valid: {self.BUTTONS}")
-        getattr(self._gba, method)()  # type: ignore[union-attr]
-        self.tick(frames)
+        getattr(self._gba, method)(frames)  # type: ignore[union-attr]
+
+    def press_button(self, button: str) -> None:
+        raise NotImplementedError(
+            "GBA edge-driven input not yet supported in free-running runtime. "
+            "mgba's auto-release input model is incompatible; phase-2 work."
+        )
+
+    def release_button(self, button: str) -> None:
+        raise NotImplementedError(
+            "GBA edge-driven input not yet supported in free-running runtime."
+        )
 
     def release_all(self) -> None:
         # PyGBA buttons auto-release after wait(); no-op here.
@@ -307,7 +350,7 @@ class PyGBAEmulator(Emulator):
     # -- video --------------------------------------------------------------
 
     def get_screen(self) -> "Image.Image":
-        return self._gba.screen.to_pil()  # type: ignore[union-attr]
+        return self._framebuffer.to_pil().convert("RGB")  # type: ignore[union-attr]
 
     # -- memory -------------------------------------------------------------
 
