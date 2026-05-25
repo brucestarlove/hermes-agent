@@ -55,6 +55,7 @@ The repo ships these bundled plugins under `plugins/`. All are opt-in — enable
 
 | Plugin | Kind | Purpose |
 |---|---|---|
+| `peonping` | hooks + slash command | Emit Hermes lifecycle events to PeonPing-compatible sound packs |
 | `disk-cleanup` | hooks + slash command | Auto-track ephemeral files and clean them on session end |
 | `observability/langfuse` | hooks | Trace turns / LLM calls / tools to [Langfuse](https://langfuse.com) |
 | `spotify` | backend (7 tools) | Native Spotify playback, queue, search, playlists, albums, library |
@@ -65,7 +66,56 @@ The repo ships these bundled plugins under `plugins/`. All are opt-in — enable
 | `hermes-achievements` | dashboard tab | Steam-style collectible badges generated from your real Hermes session history |
 | `kanban/dashboard` | dashboard tab | Kanban board UI for the multi-agent dispatcher — tasks, comments, fan-out, board switching. See [Kanban Multi-Agent](./kanban.md). |
 
-Memory providers (`plugins/memory/*`) and context engines (`plugins/context_engine/*`) are listed separately on [Memory Providers](./memory-providers.md) — they're managed through `hermes memory` and `hermes plugins` respectively. The full per-plugin detail for the two long-running hooks-based plugins follows.
+Memory providers (`plugins/memory/*`) and context engines (`plugins/context_engine/*`) are listed separately on [Memory Providers](./memory-providers.md) — they're managed through `hermes memory` and `hermes plugins` respectively. The full per-plugin detail for the long-running hooks-based plugins follows.
+
+### peonping
+
+Emits Hermes lifecycle events to a local PeonPing installation so a sound pack can react to session starts, turn completions, approval prompts, selected tool progress, terminal failures, subagent completion, and session end.
+
+PeonPing itself remains optional and external. If the plugin is enabled but the `peon` executable is not available, the hook fails open and does not interrupt the agent.
+
+**How it works:**
+
+| Hook | PeonPing event |
+|---|---|
+| `pre_llm_call` | `SessionStart` on the first turn, `UserPromptSubmit` on later turns |
+| `post_llm_call` | `Stop` |
+| `pre_approval_request` | `PermissionRequest` |
+| `pre_tool_call` | `Notification` for tools listed in `tool_progress_events` |
+| `post_tool_call` | `PostToolUseFailure` for selected failing tools; defaults to `terminal` |
+| `subagent_stop` | `SubagentStop` |
+| `on_session_finalize` / `on_session_reset` | `SessionEnd` |
+
+**Config path:** by default the plugin reads `$HERMES_HOME/peonping/config.json`. Override with `HERMES_PEONPING_CONFIG=/path/to/config.json`. Missing config is okay; built-in defaults are used.
+
+Minimal config creation:
+
+```bash
+mkdir -p "$HERMES_HOME/peonping"
+cat > "$HERMES_HOME/peonping/config.json" <<'JSON'
+{
+  "schema_version": 1,
+  "enabled": true,
+  "peon_command": "peon",
+  "timeout_seconds": 2,
+  "voicepack": "",
+  "tool_error_events": ["terminal"],
+  "tool_progress_events": []
+}
+JSON
+```
+
+Set `voicepack` when a PeonPing pack should receive a hint in emitted payloads. Set `tool_progress_events` sparingly; for example, `terminal` or `delegate_task` if you want long-running work to make progress sounds. `enabled` and per-hook `enabled_events` accept booleans or common strings (`true`/`false`, `yes`/`no`, `on`/`off`, `1`/`0`). `timeout_seconds` controls how long Hermes waits for the local executable; the default is 2 seconds and hooks still fail open on timeout or execution errors.
+
+**Executable resolution order:** the adapter runs the first configured/found command in this order: `peon_command` from the adapter config, `PEON_PING_SCRIPT`, `peon_dir/peon.sh`, `CLAUDE_PEON_DIR/peon.sh`, `CLAUDE_CONFIG_DIR/hooks/peon-ping/peon.sh`, `~/.claude/hooks/peon-ping/peon.sh`, `~/.openpeon/peon.sh`, then `peon` on `PATH`.
+
+**Privacy / trust warning:** enabling this plugin may execute existing legacy PeonPing, OpenPeon, or Claude hook scripts from the locations above. Enabled events can pass session IDs, the current working directory, selected command/tool input text, approval prompt text, assistant response excerpts, subagent summaries, and tool error details to that local executable. Only enable the plugin when you trust the resolved executable and sound pack.
+
+**Slash command** — `/peonping` shows the resolved config path, PeonPing executable, voicepack hint, timeout, selected tools, and enabled events. If the config cannot be loaded (invalid JSON, wrong shape, unreadable path, or a directory path), `/peonping` reports the path and load error instead of crashing. `/peonping json` returns the raw adapter config when config is valid.
+
+**Enabling:** `hermes plugins enable peonping` (or check the box in `hermes plugins`). Then run `/peonping` in chat; expected status shows your config path, the resolved executable or `<not found>`, and enabled events. `<not found>` is non-fatal but means no sound will play until you install PeonPing or set `peon_command`.
+
+**Disabling again:** `hermes plugins disable peonping`.
 
 ### disk-cleanup
 
