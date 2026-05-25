@@ -55,6 +55,7 @@ The repo ships these bundled plugins under `plugins/`. All are opt-in — enable
 
 | Plugin | Kind | Purpose |
 |---|---|---|
+| `peonping` | hooks + slash command | Emit Hermes lifecycle events to PeonPing-compatible sound packs |
 | `disk-cleanup` | hooks + slash command | Auto-track ephemeral files and clean them on session end |
 | `observability/langfuse` | hooks | Trace turns / LLM calls / tools to [Langfuse](https://langfuse.com) |
 | `spotify` | backend (7 tools) | Native Spotify playback, queue, search, playlists, albums, library |
@@ -65,7 +66,50 @@ The repo ships these bundled plugins under `plugins/`. All are opt-in — enable
 | `hermes-achievements` | dashboard tab | Steam-style collectible badges generated from your real Hermes session history |
 | `kanban/dashboard` | dashboard tab | Kanban board UI for the multi-agent dispatcher — tasks, comments, fan-out, board switching. See [Kanban Multi-Agent](./kanban.md). |
 
-Memory providers (`plugins/memory/*`) and context engines (`plugins/context_engine/*`) are listed separately on [Memory Providers](./memory-providers.md) — they're managed through `hermes memory` and `hermes plugins` respectively. The full per-plugin detail for the two long-running hooks-based plugins follows.
+Memory providers (`plugins/memory/*`) and context engines (`plugins/context_engine/*`) are listed separately on [Memory Providers](./memory-providers.md) — they're managed through `hermes memory` and `hermes plugins` respectively. The full per-plugin detail for the long-running hooks-based plugins follows.
+
+### peonping
+
+Emits Hermes lifecycle events to a local PeonPing installation so a sound pack can react to session starts, turn completions, approval prompts, selected tool progress, terminal failures, subagent completion, and session end.
+
+PeonPing itself remains optional and external. If the plugin is enabled but the `peon` executable is not available, the hook fails open and does not interrupt the agent.
+
+**How it works:**
+
+| Hook | PeonPing event |
+|---|---|
+| `pre_llm_call` | `SessionStart` on the first turn, `UserPromptSubmit` on later turns |
+| `post_llm_call` | `Stop` |
+| `pre_approval_request` | `PermissionRequest` |
+| `pre_tool_call` | `Notification` for tools listed in `tool_progress_events` |
+| `post_tool_call` | `PostToolUseFailure` for selected failing tools; defaults to `terminal` |
+| `subagent_stop` | `SubagentStop` |
+| `on_session_finalize` / `on_session_reset` | `SessionEnd` |
+
+**Config path:** by default the plugin reads `$HERMES_HOME/peonping/config.json`. Override with `HERMES_PEONPING_CONFIG=/path/to/config.json`.
+
+Minimal config:
+
+```json
+{
+  "schema_version": 1,
+  "enabled": true,
+  "peon_command": "peon",
+  "voicepack": "",
+  "tool_error_events": ["terminal"],
+  "tool_progress_events": []
+}
+```
+
+Set `voicepack` when a PeonPing pack should receive a hint in emitted payloads. Set `tool_progress_events` sparingly; for example, `terminal` or `delegate_task` if you want long-running work to make progress sounds.
+
+**Payload contents:** enabled events can pass session IDs, working directories, selected command text, assistant response excerpts, subagent summaries, and tool error details to the configured local PeonPing executable. Only enable the plugin when you trust that executable and sound pack.
+
+**Slash command** — `/peonping` shows the resolved config path, PeonPing executable, voicepack hint, selected tools, and enabled events. `/peonping json` returns the raw adapter config.
+
+**Enabling:** `hermes plugins enable peonping` (or check the box in `hermes plugins`).
+
+**Disabling again:** `hermes plugins disable peonping`.
 
 ### disk-cleanup
 
